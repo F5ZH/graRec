@@ -1,0 +1,25 @@
+
+
+# PyTorch and related (CUDA 12.1 recommended; adjust if using CPU or older CUDA)
+torch==2.3.0
+torchaudio==2.3.0
+torchvision==0.18.0
+
+# Model zoo and backbones
+timm==0.9.16
+
+# Data processing
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Image handling
+Pillow>=9.0.0
+
+# Progress bar
+tqdm>=4.66.0
+
+# Optional: for better JSON formatting (not required, but useful)
+jsonschema>=4.23.0
+
+# CPU/GPU acceleration hints (if using NVIDIA)
+# 注意：CUDA 驱动由系统和 PyTorch 安装自带；无需单独 pip 安装
