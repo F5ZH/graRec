@@ -84,27 +84,17 @@ def safe_pil_loader(path: str) -> Image.Image:
       - converts palette/alpha images to opaque RGB to remove PIL warnings
     On failure, raises RuntimeError with a [BROKEN_IMAGE] tag.
     """
-    try:
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            with Image.open(path) as img:
-                # 检查是否有 Truncated 警告
-                is_truncated = any("Truncated" in str(warn.message) for warn in w)
-                if is_truncated:
-                    print(f"[WARNING] Truncated image: {path}")
-                # 检查是否有 DecompressionBombWarning 警告
-                is_decomp = any("DecompressionBombWarning" in str(warn.message) for warn in w)
-                if is_decomp:
-                    print(f"[WARNING] DecompressionBomb image: {path}")
-                if img.mode == "P":
-                    img = img.convert("RGBA")
-                if img.mode == "RGBA":
-                    bg = Image.new("RGB", img.size, (0, 0, 0))
-                    bg.paste(img, mask=img.split()[3])
-                    img = bg
-                else:
-                    img = img.convert("RGB")
-                return img
+    try: 
+        with Image.open(path) as img:
+            if img.mode == "P":
+                img = img.convert("RGBA")
+            if img.mode == "RGBA":
+                bg = Image.new("RGB", img.size, (0, 0, 0))
+                bg.paste(img, mask=img.split()[3])
+                img = bg
+            else:
+                img = img.convert("RGB")
+            return img
     except Exception as e:
         raise RuntimeError(f"[BROKEN_IMAGE] {path}: {repr(e)}")
 
@@ -435,8 +425,9 @@ def train(args):
     set_seed(args.seed)
 
     #设置可视化存储路径
-    writer = SummaryWriter(log_dir=outdir / 'tb_logs')
-    print(f"📊 TensorBoard logs will be saved to: {outdir / 'tb_logs'}")
+    log_path = args.outdir + '/tb_logs'
+    writer = SummaryWriter(log_dir=log_path)
+    print(f"📊 TensorBoard logs will be saved to: {log_path}")
 
     # 存储超参
     hparams = {k: v for k, v in vars(args).items() if isinstance(v, (int, float, str, bool))}
