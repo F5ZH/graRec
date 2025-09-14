@@ -38,12 +38,12 @@
   # --csv_path /root/autodl-tmp/project/runs/main_elr_arc_micro16_pt/predictions.csv 
 
 
-#   5000训练测试 无mix增强 100轮 默认启用预训练
+#   5000训练测试 无mix增强 20轮 默认启用预训练
   # python wsdan_convnext_elr_single.py \
   # --mode train \
   # --train_dir /root/autodl-tmp/project/data/WebiNat-5000/train \
   # --arch convnext_base \
-  # --epochs 100 --img_size 256 --batch_size 64 \
+  # --epochs 20 --img_size 256 --batch_size 64 \
   # --loss elrplus --elr_lambda 2.0 \
   # --curriculum_epochs 90 \
   # --mixup 0 --cutmix 0 --randaug_N 2 --randaug_M 10 \
@@ -57,17 +57,17 @@
 #   5000训练，耗时更短的方法 
   python wsdan_convnext_elr_single.py \
   --mode train \
-  --train_dir /root/autodl-tmp/project/data/WebiNat-5000/train_processed \
+  --train_dir /root/autodl-tmp/project/data/WebiNat-5000/train \
   --arch convnext_base \
-  --epochs 100 --img_size 256 --batch_size 128 \
+  --epochs 20 --img_size 256 --batch_size 128 \
   --loss elrplus --elr_lambda 2.0 \
-  --curriculum_epochs 90 \
+  --curriculum_start 30 \
   --mixup 0 --cutmix 0 --randaug_N 2 --randaug_M 10 \
   --use_wsdan --K 4 --erase_p 0.3 --wsdan_warm 2 \
   --arcface --margin 0.15 --scale 20 \
   --pretrained --freeze_backbone_epochs 1 --backbone_lr_mult 0.1 \
-  --workers 10 --amp \
-  --channels_last --grad_ckpt --microbatch 16 \
+  --workers 14 --amp \
+  --channels_last --grad_ckpt --microbatch 32 \
   --outdir /root/autodl-tmp/project/runs/main_elr_arc_micro16_pt_5000
 
 #    5000预测
