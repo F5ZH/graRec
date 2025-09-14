@@ -37,6 +37,10 @@ from torchvision.datasets import ImageFolder
 
 import warnings
 
+#visualization
+from torch.utils.tensorboard import SummaryWriter
+import torchvision.utils as vutils
+
 
 # Robust PIL settings
 from PIL import Image, ImageFile
@@ -430,6 +434,14 @@ def train(args):
         print(f"💾 GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     set_seed(args.seed)
 
+    #设置可视化存储路径
+    writer = SummaryWriter(log_dir=outdir / 'tb_logs')
+    print(f"📊 TensorBoard logs will be saved to: {outdir / 'tb_logs'}")
+
+    # 存储超参
+    hparams = {k: v for k, v in vars(args).items() if isinstance(v, (int, float, str, bool))}
+    writer.add_hparams(hparams, {})
+
     # data
     train_loader, val_loader, train_ds = build_loaders(
         args.train_dir, args.val_dir, args.img_size, args.batch_size, args.workers,
@@ -607,9 +619,16 @@ def train(args):
 
         print(f"Epoch {epoch}: loss={np.mean(loss_meter):.4f}, acc~={np.mean(acc_meter):.4f}")
 
+        #记录相关值用于可视化
+        train_loss_mean = np.mean(loss_meter)
+        train_acc_mean = np.mean(acc_meter)
+        writer.add_scalar('Loss/Train', train_loss_mean, epoch)
+        writer.add_scalar('Accuracy/Train', train_acc_mean, epoch)
+
         # validate
         if val_loader is not None:
             val_acc = evaluate(model, val_loader, device)
+            writer.add_scalar('Accuracy/Val', val_acc, epoch)
             print(f"  VAL acc={val_acc:.4f}")
             if val_acc > best_acc:
                 best_acc = val_acc
@@ -617,6 +636,7 @@ def train(args):
         else:
             if (epoch+1) % 5 == 0:
                 torch.save({'model': model.state_dict(), 'epoch': epoch, 'args': vars(args)}, outdir / 'last.pt')
+        writer.flush()
 
     torch.save({'model': model.state_dict(), 'epoch': args.epochs-1, 'args': vars(args)}, outdir / 'final.pt')
     print(f"Training finished. Checkpoints saved in {outdir}")
