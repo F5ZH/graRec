@@ -10,6 +10,7 @@ Single-file, single-model training & inference pipeline for
 - Noise-robust losses (ELR+/SCE/GCE), long-tail aware ✔
 - Fine-grained friendly (WS-DAN: erase + zoom-in) ✔
 - Exports required CSVs ✔
+- ✅ NEW: Dual-branch (Global + Local Crop) with ConvNeXt backbone
 """
 
 # ---------- CUDA memory fragmentation guard (set BEFORE importing torch) ----------
@@ -37,7 +38,7 @@ from torchvision.datasets import ImageFolder
 
 import warnings
 
-#visualization
+# visualization
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.utils as vutils
 
@@ -313,13 +314,49 @@ def wsdan_erase(images: torch.Tensor, attn_maps: torch.Tensor, p: float = 0.5, t
             out[b] = out[b] * (1 - mask.unsqueeze(0))  # (1,H,W) 广播到 3 通道
     return out
 
+# ✅ NEW: 局部区域裁剪放大模块
+def crop_and_resize_by_attn(images: torch.Tensor, attn_maps: torch.Tensor, output_size: int = 224):
+    """
+    根据注意力图裁剪最显著区域并放大到指定尺寸。
+    images: (B, 3, H, W)
+    attn_maps: (B, K, H, W) — 通常 K=1 或取 argmax(1)
+    output_size: int — 裁剪后 resize 到的尺寸
+    """
+    B, _, H, W = images.shape
+    # 取每个样本中注意力最强的区域（K 中取最大响应）
+    attn_max, _ = torch.max(attn_maps, dim=1)  # (B, H, W)
+
+    # 找到每个图像中注意力最集中的点（近似中心）
+    flat_attn = attn_max.view(B, -1)  # (B, H*W)
+    max_idx = torch.argmax(flat_attn, dim=1)  # (B,)
+    center_y = max_idx // W
+    center_x = max_idx % W
+
+    # 定义裁剪窗口大小（取原图 1/3 区域）
+    crop_size = max(H // 3, W // 3)
+    half = crop_size // 2
+
+    # 构建裁剪边界，防止越界
+    y0 = torch.clamp(center_y - half, 0, H - crop_size)
+    y1 = y0 + crop_size
+    x0 = torch.clamp(center_x - half, 0, W - crop_size)
+    x1 = x0 + crop_size
+
+    # 裁剪 + resize
+    crops = []
+    for b in range(B):
+        crop = images[b, :, y0[b]:y1[b], x0[b]:x1[b]]  # (3, crop, crop)
+        crop_resized = F.interpolate(crop.unsqueeze(0), size=(output_size, output_size), mode='bilinear', align_corners=False)
+        crops.append(crop_resized)
+    return torch.cat(crops, dim=0)  # (B, 3, S, S)
 
 # -------------------------
-# Model wrapper
+# ✅ NEW: Dual Branch Model
 # -------------------------
-class ConvNeXtWS(nn.Module):
+class ConvNeXtDualBranch(nn.Module):
     def __init__(self, arch: str, num_classes: int, use_wsdan: bool = True, K: int = 8,
-                 arcface: bool = True, m: float=0.25, s: float=30.0, pretrained: bool=False):
+                 arcface: bool = True, m: float = 0.25, s: float = 30.0, pretrained: bool = False,
+                 local_crop_size: int = 224, lambda_global: float = 1.0, lambda_local: float = 0.5):
         super().__init__()
         assert timm is not None, "Please install timm: pip install timm"
         model_name = {
@@ -331,39 +368,90 @@ class ConvNeXtWS(nn.Module):
         self.num_classes = num_classes
         self.use_wsdan = use_wsdan
         self.arcface = arcface
+        self.local_crop_size = local_crop_size
+        self.lambda_global = lambda_global
+        self.lambda_local = lambda_local
 
         feat_dim = self.backbone.num_features
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         if use_wsdan:
             self.wsdan = WSDAN(in_ch=feat_dim, K=K)
-        self.dropout = nn.Dropout(0.1)
-        self.feat_proj = nn.Linear(feat_dim, 1024)
+
+        # === 全局分支 ===
+        self.dropout_global = nn.Dropout(0.1)
+        self.feat_proj_global = nn.Linear(feat_dim, 1024)
         if arcface:
-            self.margin_head = ArcMarginProduct(1024, num_classes, s=s, m=m)
+            self.margin_head_global = ArcMarginProduct(1024, num_classes, s=s, m=m)
         else:
-            self.fc = nn.Linear(1024, num_classes)
+            self.fc_global = nn.Linear(1024, num_classes)
+
+        # === 局部分支 ===
+        self.dropout_local = nn.Dropout(0.1)
+        self.feat_proj_local = nn.Linear(feat_dim, 1024)
+        if arcface:
+            self.margin_head_local = ArcMarginProduct(1024, num_classes, s=s, m=m)
+        else:
+            self.fc_local = nn.Linear(1024, num_classes)
 
     @torch.no_grad()
     def get_attn(self, x: torch.Tensor):
-        feat = self.backbone.forward_features(x)  # (B, C, H, W)
+        feat = self.backbone.forward_features(x)
         return self.wsdan(feat) if self.use_wsdan else None
 
     def forward(self, x, y: Optional[torch.Tensor] = None, return_attn: bool = False):
         feat = self.backbone.forward_features(x)  # (B, C, H, W)
         attn_maps = self.wsdan(feat) if self.use_wsdan else None
-        pooled = self.global_pool(feat).flatten(1)
-        z = F.relu(self.feat_proj(self.dropout(pooled)))
+
+        # === 全局分支 ===
+        pooled_global = self.global_pool(feat).flatten(1)
+        z_global = F.relu(self.feat_proj_global(self.dropout_global(pooled_global)))
         if self.arcface:
             if y is not None:
-                logits = self.margin_head(z, y)  # 训练：带 margin
+                logits_global = self.margin_head_global(z_global, y)
             else:
-                # 推理：用训练好的 ArcFace 权重做“无 margin”余弦分类
-                logits = F.linear(F.normalize(z), F.normalize(self.margin_head.weight)) * self.margin_head.s
+                logits_global = F.linear(F.normalize(z_global), F.normalize(self.margin_head_global.weight)) * self.margin_head_global.s
         else:
-            logits = self.fc(z)
+            logits_global = self.fc_global(z_global)
+
+        # === 局部分支 ===
+        if self.use_wsdan and attn_maps is not None:
+            # 裁剪最显著区域并放大
+            x_local = crop_and_resize_by_attn(x, attn_maps, self.local_crop_size)
+            # 再次提取特征（共享 backbone）
+            feat_local = self.backbone.forward_features(x_local)  # (B, C, H', W')
+            pooled_local = self.global_pool(feat_local).flatten(1)
+            z_local = F.relu(self.feat_proj_local(self.dropout_local(pooled_local)))
+            if self.arcface:
+                if y is not None:
+                    logits_local = self.margin_head_local(z_local, y)
+                else:
+                    logits_local = F.linear(F.normalize(z_local), F.normalize(self.margin_head_local.weight)) * self.margin_head_local.s
+            else:
+                logits_local = self.fc_local(z_local)
+        else:
+            # 无注意力时，局部分支复制全局分支
+            logits_local = logits_global.clone()
+
+        # 融合 logits（训练和推理都用）
+        logits_fused = logits_global + logits_local
+
         if return_attn:
-            return logits, z, attn_maps
-        return logits
+            return logits_fused, z_global, attn_maps, logits_global, logits_local
+        return logits_fused
+
+    def get_losses(self, logits_global, logits_local, y, soft_targets=None):
+        """返回加权损失，用于训练"""
+        if soft_targets is not None:
+            loss_global = criterion_with_soft(logits_global, soft_targets)
+            loss_local = criterion_with_soft(logits_local, soft_targets)
+        else:
+            loss_global = F.cross_entropy(logits_global, y, reduction='none', label_smoothing=0.1)
+            loss_local = F.cross_entropy(logits_local, y, reduction='none', label_smoothing=0.1)
+
+        loss_global = loss_global.mean()
+        loss_local = loss_local.mean()
+        total_loss = self.lambda_global * loss_global + self.lambda_local * loss_local
+        return total_loss, loss_global, loss_local
 
 # -------------------------
 # MixUp / CutMix
@@ -424,7 +512,7 @@ def train(args):
         print(f"💾 GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     set_seed(args.seed)
 
-    #设置可视化存储路径
+    # 设置可视化存储路径
     log_path = args.outdir + '/tb_logs'
     writer = SummaryWriter(log_dir=log_path)
     print(f"📊 TensorBoard logs will be saved to: {log_path}")
@@ -450,8 +538,19 @@ def train(args):
     save_json({'idx_to_class': idx_to_class, 'class_to_idx': class_to_idx, 'num_classes': num_classes}, outdir / 'classes.json')
 
     # model
-    model = ConvNeXtWS(args.arch, num_classes, use_wsdan=args.use_wsdan, K=args.K,
-                       arcface=args.arcface, m=args.margin, s=args.scale, pretrained=args.pretrained)
+    model = ConvNeXtDualBranch(
+        arch=args.arch,
+        num_classes=num_classes,
+        use_wsdan=args.use_wsdan,
+        K=args.K,
+        arcface=args.arcface,
+        m=args.margin,
+        s=args.scale,
+        pretrained=args.pretrained,
+        local_crop_size=args.local_crop_size,
+        lambda_global=args.lambda_global,
+        lambda_local=args.lambda_local
+    )
     model = model.to(device)
 
     # === NEW: init from a previous checkpoint (weights only) ===
@@ -562,41 +661,51 @@ def train(args):
                 ys_mb   = ys[s:e]
 
                 with torch.amp.autocast('cuda', enabled=args.amp):
-                    logits_mb, feats_mb, _ = model(imgs_mb, ys_mb if model.arcface else None, return_attn=True)
+                    # ✅ NEW: 双分支输出
+                    logits_fused, z_global, attn_maps, logits_global, logits_local = model(
+                        imgs_mb, ys_mb if model.arcface else None, return_attn=True
+                    )
 
+                    # ✅ NEW: 双分支损失
                     if soft_targets is not None:
                         soft_mb = soft_targets[s:e]
-                        ce_mb = criterion_with_soft(logits_mb, soft_mb)
+                        total_loss_mb, loss_global_mb, loss_local_mb = model.get_losses(
+                            logits_global, logits_local, ys_mb, soft_mb
+                        )
                     else:
-                        ce_mb = F.cross_entropy(logits_mb, ys_mb, reduction='none', label_smoothing=args.label_smooth)
+                        total_loss_mb, loss_global_mb, loss_local_mb = model.get_losses(
+                            logits_global, logits_local, ys_mb
+                        )
 
+                    # 噪声鲁棒损失作用在融合 logits 上
                     if args.loss == 'elrplus':
                         idxs_mb = torch.arange(global_step + s, global_step + e, device=device)
-                        noise_reg_mb = elr_mem(logits_mb, ys_mb, idxs_mb)
-                        loss_all_mb = ce_mb + noise_reg_mb
+                        noise_reg_mb = elr_mem(logits_fused, ys_mb, idxs_mb)
+                        total_loss_mb = total_loss_mb + noise_reg_mb.mean()
                     elif args.loss == 'sce':
-                        loss_all_mb = sce(logits_mb, ys_mb)
+                        total_loss_mb = sce(logits_fused, ys_mb).mean()
                     elif args.loss == 'gce':
-                        loss_all_mb = gce(logits_mb, ys_mb)
-                    else:
-                        loss_all_mb = ce_mb
+                        total_loss_mb = gce(logits_fused, ys_mb).mean()
+                    # else: 保留原加权损失
 
+                    # curriculum 作用在融合 logits 上（简化处理）
                     if epoch >= args.curriculum_start:
-                        k_mb = int(max(1, p_keep * loss_all_mb.size(0)))
-                        _, topk_idx_mb = torch.topk(-loss_all_mb, k_mb)
-                        loss_mb = loss_all_mb[topk_idx_mb].mean()
-                    else:
-                        loss_mb = loss_all_mb.mean()
+                        # 重新计算 fused logits 的损失用于 curriculum
+                        ce_fused = F.cross_entropy(logits_fused, ys_mb, reduction='none', label_smoothing=args.label_smooth)
+                        k_mb = int(max(1, p_keep * ce_fused.size(0)))
+                        _, topk_idx_mb = torch.topk(-ce_fused, k_mb)
+                        total_loss_mb = ce_fused[topk_idx_mb].mean()
+                        # 若想保留双分支损失的 curriculum，可分别对 logits_global/local 做，再加权 —— 此处简化
 
-                    loss_mb = loss_mb / accum_steps
+                    total_loss_mb = total_loss_mb / accum_steps
 
-                scaler.scale(loss_mb).backward()
+                scaler.scale(total_loss_mb).backward()
 
                 with torch.no_grad():
-                    pred_mb = logits_mb.argmax(1)
+                    pred_mb = logits_fused.argmax(1)  # 使用融合 logits 预测
                     batch_corr += (pred_mb == ys_mb).sum().item()
                     batch_tot  += ys_mb.numel()
-                    batch_loss_val += loss_mb.item() * accum_steps
+                    batch_loss_val += total_loss_mb.item() * accum_steps
 
             scaler.step(optimizer)     # optimizer.step() first
             scaler.update()
@@ -608,9 +717,24 @@ def train(args):
             acc_meter.append(acc)
             loss_meter.append(batch_loss_val)
 
+            # ✅ NEW: 可视化局部裁剪图像（每100步）
+            if use_erase and epoch % 10 == 0 and global_step % 100 == 0 and attn_maps is not None:
+                with torch.no_grad():
+                    # 取前4张做可视化
+                    vis_imgs = imgs[:4].clone()
+                    vis_attn = attn_maps[:4]
+                    if vis_attn is not None:
+                        x_local_vis = crop_and_resize_by_attn(vis_imgs, vis_attn, args.local_crop_size)
+                        # 原图
+                        grid_orig = vutils.make_grid(vis_imgs, normalize=True, scale_each=True)
+                        writer.add_image('OriginalImages', grid_orig, global_step)
+                        # 局部裁剪图
+                        grid_local = vutils.make_grid(x_local_vis, normalize=True, scale_each=True)
+                        writer.add_image('LocalCrops', grid_local, global_step)
+
         print(f"Epoch {epoch}: loss={np.mean(loss_meter):.4f}, acc~={np.mean(acc_meter):.4f}")
 
-        #记录相关值用于可视化
+        # 记录相关值用于可视化
         train_loss_mean = np.mean(loss_meter)
         train_acc_mean = np.mean(acc_meter)
         writer.add_scalar('Loss/Train', train_loss_mean, epoch)
@@ -639,6 +763,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> floa
         for imgs, ys in tqdm(loader, desc="Eval"):
             imgs = imgs.to(device, non_blocking=True)
             ys = ys.to(device, non_blocking=True)
+            # ✅ 推理时直接使用融合 logits
             logits = model(imgs, None, return_attn=False)
             pred = logits.argmax(1)
             corr += (pred == ys).sum().item()
@@ -683,7 +808,7 @@ def predict(args):
     idx_to_class = {int(k): v for k, v in cls_map['idx_to_class'].items()}
     num_classes = len(idx_to_class)
 
-    model = ConvNeXtWS(
+    model = ConvNeXtDualBranch(
         arch=ck_args.get('arch', args.arch),
         num_classes=num_classes,
         use_wsdan=ck_args.get('use_wsdan', True),
@@ -691,7 +816,10 @@ def predict(args):
         arcface=ck_args.get('arcface', True),
         m=ck_args.get('margin', 0.25),
         s=ck_args.get('scale', 30.0),
-        pretrained=False
+        pretrained=False,
+        local_crop_size=ck_args.get('local_crop_size', 224),
+        lambda_global=ck_args.get('lambda_global', 1.0),
+        lambda_local=ck_args.get('lambda_local', 0.5)
     )
     model.load_state_dict(ckpt['model'], strict=False)
     model.eval().to(device)
@@ -705,6 +833,7 @@ def predict(args):
     with torch.no_grad():
         for imgs, paths in tqdm(dl, desc='Predict'):
             imgs = imgs.to(device, non_blocking=True)
+            # ✅ 使用融合 logits 预测
             logits = model(imgs, None)
             probs = torch.softmax(logits, dim=1)
             pred = probs.argmax(1).cpu().numpy()
@@ -794,6 +923,11 @@ def get_args():
     # === NEW: continue training from a checkpoint (weights only) ===
     ap.add_argument('--init_from', type=str, default=None,
                     help='Load model weights from a checkpoint (weights only) to continue training.')
+
+    # ✅ NEW: Dual Branch 参数
+    ap.add_argument('--lambda_global', type=float, default=1.0, help='Global branch loss weight')
+    ap.add_argument('--lambda_local', type=float, default=0.5, help='Local branch loss weight')
+    ap.add_argument('--local_crop_size', type=int, default=224, help='Size to resize local crop')
 
     # Predict
     ap.add_argument('--checkpoint', type=str, default=None)
