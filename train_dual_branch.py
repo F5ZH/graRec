@@ -11,6 +11,7 @@ Single-file, single-model training & inference pipeline for
 - Fine-grained friendly (WS-DAN: erase + zoom-in) ✔
 - Exports required CSVs ✔
 - ✅ NEW: Dual-branch (Global + Local Crop) with ConvNeXt backbone
+- ✅ NEW: K-Fold Cross Validation (Stratified)
 """
 
 # ---------- CUDA memory fragmentation guard (set BEFORE importing torch) ----------
@@ -23,16 +24,17 @@ import json
 import random
 import argparse
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+from sklearn.model_selection import StratifiedKFold  # ✅ NEW for K-Fold
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler, Subset
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 
@@ -132,9 +134,12 @@ class AlbumentationsWrapper:
     def __call__(self, img):
         return self.tf(img)
 
-def make_class_balanced_sampler(dataset: ImageFolder, mode: str = "sqrt"):
+def make_class_balanced_sampler(dataset: Dataset, mode: str = "sqrt"):
     # dataset.targets is list[int] for ImageFolder
-    y = np.array(dataset.targets, dtype=np.int64)
+    if isinstance(dataset, Subset):
+        y = np.array([dataset.dataset.targets[i] for i in dataset.indices], dtype=np.int64)
+    else:
+        y = np.array(dataset.targets, dtype=np.int64)
     counts = np.bincount(y)
     counts[counts == 0] = 1
     if mode == "sqrt":
@@ -154,12 +159,30 @@ def build_loaders(train_dir: str,
                   randaug: Optional[Tuple[int,int]],
                   mixup: float,
                   cutmix: float,
-                  class_balanced: bool):
+                  class_balanced: bool,
+                  train_indices: Optional[List[int]] = None,
+                  val_indices: Optional[List[int]] = None):
     train_tf = AlbumentationsWrapper(img_size, 'train', randaug)
     val_tf   = AlbumentationsWrapper(img_size, 'val', None)
 
-    train_ds = ImageFolder(train_dir, transform=train_tf, loader=safe_pil_loader)
-    val_ds = ImageFolder(val_dir, transform=val_tf, loader=safe_pil_loader) if val_dir and os.path.isdir(val_dir) else None
+    full_train_ds = ImageFolder(train_dir, transform=train_tf, loader=safe_pil_loader)
+
+    if val_dir and os.path.isdir(val_dir):
+        # 使用外部验证集（兼容旧逻辑）
+        train_ds = full_train_ds
+        val_ds = ImageFolder(val_dir, transform=val_tf, loader=safe_pil_loader)
+    else:
+        # 使用 K-Fold 划分
+        if train_indices is not None and val_indices is not None:
+            train_ds = Subset(full_train_ds, train_indices)
+            val_ds = Subset(full_train_ds, val_indices)
+            # 为 Subset 设置 targets 属性，以便 sampler 使用
+            train_ds.targets = [full_train_ds.targets[i] for i in train_indices]
+            val_ds.targets = [full_train_ds.targets[i] for i in val_indices]
+        else:
+            # 默认：整个训练集作为训练（无验证）
+            train_ds = full_train_ds
+            val_ds = None
 
     sampler = make_class_balanced_sampler(train_ds) if class_balanced else None
 
@@ -185,7 +208,7 @@ def build_loaders(train_dir: str,
         prefetch_factor=(2 if workers > 0 else None)
     ) if val_ds else None
 
-    return train_loader, val_loader, train_ds
+    return train_loader, val_loader, full_train_ds if val_dir else train_ds
 
 # -------------------------
 # Losses for noisy labels
@@ -363,6 +386,7 @@ class ConvNeXtDualBranch(nn.Module):
             'convnext_tiny': 'convnext_tiny.fb_in22k_ft_in1k',
             'convnext_small': 'convnext_small.fb_in22k_ft_in1k',
             'convnext_base': 'convnext_base.fb_in22k_ft_in1k',
+            'convnext_large':'convnext_large.fb_in22k_ft_in1k',
         }.get(arch, 'convnext_base.fb_in22k_ft_in1k')
         self.backbone = timm.create_model(model_name, pretrained=pretrained, features_only=False, num_classes=0)
         self.num_classes = num_classes
@@ -504,7 +528,7 @@ def robust_iter(dataloader):
 # -------------------------
 # Training / Evaluation
 # -------------------------
-def train(args):
+def train(args, fold: Optional[int] = None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"🚀 Using device: {device}")
     if torch.cuda.is_available():
@@ -512,25 +536,38 @@ def train(args):
         print(f"💾 GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     set_seed(args.seed)
 
-    # 设置可视化存储路径
-    log_path = args.outdir + '/tb_logs'
+    # 设置可视化存储路径（每个 fold 独立）
+    log_dir_suffix = f"_fold{fold}" if fold is not None else ""
+    log_path = os.path.join(args.outdir, f'tb_logs{log_dir_suffix}')
     writer = SummaryWriter(log_dir=log_path)
     print(f"📊 TensorBoard logs will be saved to: {log_path}")
 
     # 存储超参
     hparams = {k: v for k, v in vars(args).items() if isinstance(v, (int, float, str, bool))}
+    if fold is not None:
+        hparams['fold'] = fold
     writer.add_hparams(hparams, {})
 
     # data
-    train_loader, val_loader, train_ds = build_loaders(
-        args.train_dir, args.val_dir, args.img_size, args.batch_size, args.workers,
-        (args.randaug_N, args.randaug_M) if args.randaug_N>0 else None,
-        args.mixup, args.cutmix, args.class_balanced)
+    if args.val_dir and os.path.isdir(args.val_dir):
+        # 使用固定验证集
+        train_loader, val_loader, train_ds = build_loaders(
+            args.train_dir, args.val_dir, args.img_size, args.batch_size, args.workers,
+            (args.randaug_N, args.randaug_M) if args.randaug_N>0 else None,
+            args.mixup, args.cutmix, args.class_balanced)
+    else:
+        # 使用 K-Fold 划分（train_indices/val_indices 由外部传入）
+        train_loader, val_loader, train_ds = build_loaders(
+            args.train_dir, None, args.img_size, args.batch_size, args.workers,
+            (args.randaug_N, args.randaug_M) if args.randaug_N>0 else None,
+            args.mixup, args.cutmix, args.class_balanced,
+            getattr(args, 'train_indices', None),
+            getattr(args, 'val_indices', None))
 
     num_classes = len(train_ds.classes)
     print(f"Num classes: {num_classes}")
 
-    # save mapping
+    # save mapping (only once, in main folder)
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     idx_to_class = {i: c for i, c in enumerate(train_ds.classes)}
@@ -747,14 +784,20 @@ def train(args):
             print(f"  VAL acc={val_acc:.4f}")
             if val_acc > best_acc:
                 best_acc = val_acc
-                torch.save({'model': model.state_dict(), 'epoch': epoch, 'args': vars(args)}, outdir / 'best.pt')
+                ckpt_name = f'best{log_dir_suffix}.pt'
+                torch.save({'model': model.state_dict(), 'epoch': epoch, 'args': vars(args), 'fold': fold}, outdir / ckpt_name)
         else:
             if (epoch+1) % 5 == 0:
-                torch.save({'model': model.state_dict(), 'epoch': epoch, 'args': vars(args)}, outdir / 'last.pt')
+                ckpt_name = f'last{log_dir_suffix}.pt'
+                torch.save({'model': model.state_dict(), 'epoch': epoch, 'args': vars(args), 'fold': fold}, outdir / ckpt_name)
         writer.flush()
 
-    torch.save({'model': model.state_dict(), 'epoch': args.epochs-1, 'args': vars(args)}, outdir / 'final.pt')
+    final_ckpt_name = f'final{log_dir_suffix}.pt'
+    torch.save({'model': model.state_dict(), 'epoch': args.epochs-1, 'args': vars(args), 'fold': fold}, outdir / final_ckpt_name)
     print(f"Training finished. Checkpoints saved in {outdir}")
+
+    writer.close()
+    return best_acc  # 返回该 fold 最佳验证准确率
 
 def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
     model.eval()
@@ -858,7 +901,7 @@ def get_args():
     ap.add_argument('--test_dir', type=str, default=None)
     ap.add_argument('--outdir', type=str, default='runs/exp')
 
-    ap.add_argument('--arch', type=str, default='convnext_base', choices=['convnext_tiny','convnext_small','convnext_base'])
+    ap.add_argument('--arch', type=str, default='convnext_base', choices=['convnext_tiny','convnext_small','convnext_base', 'convnext_large'])
     ap.add_argument('--img_size', type=int, default=384)
     ap.add_argument('--batch_size', type=int, default=128)
     ap.add_argument('--workers', type=int, default=8)
@@ -929,6 +972,10 @@ def get_args():
     ap.add_argument('--lambda_local', type=float, default=0.5, help='Local branch loss weight')
     ap.add_argument('--local_crop_size', type=int, default=224, help='Size to resize local crop')
 
+    # ✅ NEW: K-Fold 参数
+    ap.add_argument('--k_folds', type=int, default=5, help='Number of folds for cross-validation')
+    ap.add_argument('--fold', type=int, default=None, help='Train only this fold (0-indexed). If not set, train all folds.')
+
     # Predict
     ap.add_argument('--checkpoint', type=str, default=None)
     ap.add_argument('--csv_path', type=str, default='pred_results.csv')
@@ -945,7 +992,47 @@ if __name__ == '__main__':
         Path(args.outdir).mkdir(parents=True, exist_ok=True)
         with open(os.path.join(args.outdir, 'args.json'),'w') as f:
             json.dump(vars(args), f, indent=2)
-        train(args)
+
+        # 如果提供了 val_dir，则跳过交叉验证，直接训练
+        if args.val_dir and os.path.isdir(args.val_dir):
+            print("✅ Using fixed validation set (val_dir provided). Skipping K-Fold.")
+            train(args)
+        else:
+            # 否则进行 K-Fold 交叉验证
+            print(f"✅ Performing {args.k_folds}-Fold Cross Validation...")
+            full_ds = ImageFolder(args.train_dir, loader=safe_pil_loader)  # 不加 transform，只取路径和标签
+            y = np.array(full_ds.targets)
+            skf = StratifiedKFold(n_splits=args.k_folds, shuffle=True, random_state=args.seed)
+
+            fold_accuracies = []
+            fold_indices = list(skf.split(np.zeros(len(y)), y))
+
+            # 如果指定了 fold，只训练那个 fold
+            fold_range = [args.fold] if args.fold is not None else range(args.k_folds)
+
+            for fold in fold_range:
+                train_idx, val_idx = fold_indices[fold]
+                print(f"\n=== Training Fold {fold + 1}/{args.k_folds} ===")
+                # 为 args 动态添加 indices
+                args.train_indices = train_idx.tolist()
+                args.val_indices = val_idx.tolist()
+                best_val_acc = train(args, fold=fold)
+                fold_accuracies.append(best_val_acc)
+                print(f"Fold {fold} Best Val Acc: {best_val_acc:.4f}\n")
+
+            if len(fold_accuracies) > 1:
+                mean_acc = np.mean(fold_accuracies)
+                std_acc = np.std(fold_accuracies)
+                print(f"✅ {args.k_folds}-Fold CV Result: Mean={mean_acc:.4f} ± {std_acc:.4f}")
+                # 保存汇总结果
+                summary = {
+                    'fold_accuracies': fold_accuracies,
+                    'mean_accuracy': float(mean_acc),
+                    'std_accuracy': float(std_acc)
+                }
+                with open(os.path.join(args.outdir, 'cv_summary.json'), 'w') as f:
+                    json.dump(summary, f, indent=2)
+
     elif args.mode == 'predict':
         assert args.test_dir and os.path.isdir(args.test_dir), 'test_dir not found'
         assert args.checkpoint and os.path.isfile(args.checkpoint), 'checkpoint not found'
