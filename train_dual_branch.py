@@ -885,7 +885,7 @@ def get_args():
     ap.add_argument('--elr_mem', type=int, default=0, help='ELR+ memory size; 0 => len(train_set)')
 
     # Curriculum
-    ap.add_argument('--curriculum_start', type=int, default=15)
+    ap.add_argument('--curriculum_start', type=int, default=20)
     ap.add_argument('--curriculum_epochs', type=int, default=50)
     ap.add_argument('--keep_ratio_start', type=float, default=0.9)
     ap.add_argument('--keep_ratio_final', type=float, default=0.7)
