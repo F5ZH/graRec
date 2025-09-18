@@ -406,7 +406,6 @@ class SwinDualBranch(nn.Module):
          # ✅ 修改点三：swin的维度特征
         # Swin models typically have a `head` layer, even if num_classes=0.
         # The feature dim is the input dim to the head.
-        feat_dim = self.backbone.head.in_features if hasattr(self.backbone, 'head') else self.backbone.num_features
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         feature_map_ch = self.backbone.num_features
         if use_wsdan:
@@ -431,7 +430,7 @@ class SwinDualBranch(nn.Module):
     def get_attn(self, x: torch.Tensor):
         feat = self.backbone.forward_features(x)
         # ✅ 修复: 转换 Swin 输出格式以兼容 WSDAN
-        if feat.dim() == 4 and feat.shape[3] == feat.shape[1]: # Heuristic: [B, H, W, C] 格式
+        if feat.dim() == 4 and feat.shape[-1] != feat.shape[1]: # Heuristic: [B, H, W, C] 格式
             feat = feat.permute(0, 3, 1, 2) # 转换为 [B, C, H, W]
         return self.wsdan(feat) if self.use_wsdan else None
 
@@ -448,7 +447,13 @@ class SwinDualBranch(nn.Module):
             feat = feat.permute(0, 3, 1, 2) # (B, C, H, W)
         # 现在 feat 的格式统一为 (B, C, H, W)
 
-        attn_maps = self.wsdan(feat) if self.use_wsdan else None
+        if self.use_wsdan:
+            # ✅ 修复点：将 (B, H, W, C) 转换为 (B, C, H, W)
+            if feat.dim() == 4 and feat.shape[-1] != feat.shape[1]: # 检查是否为 NHWC 格式
+                feat = feat.permute(0, 3, 1, 2) # (B, H, W, C) -> (B, C, H, W)
+            attn_maps = self.wsdan(feat)
+        else:
+            attn_maps = None
         # === 全局分支 ===
         pooled_global = self.global_pool(feat).flatten(1)
         z_global = F.relu(self.feat_proj_global(self.dropout_global(pooled_global)))
