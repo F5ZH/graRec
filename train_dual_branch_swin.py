@@ -403,12 +403,13 @@ class SwinDualBranch(nn.Module):
         # The feature dim is the input dim to the head.
         feat_dim = self.backbone.head.in_features if hasattr(self.backbone, 'head') else self.backbone.num_features
         self.global_pool = nn.AdaptiveAvgPool2d(1)
+        feature_map_ch = self.backbone.num_features
         if use_wsdan:
-            self.wsdan = WSDAN(in_ch=feat_dim, K=K)
+            self.wsdan = WSDAN(in_ch=feature_map_ch, K=K)
 
         # === 全局分支 ===
         self.dropout_global = nn.Dropout(0.1)
-        self.feat_proj_global = nn.Linear(feat_dim, 1024)
+        self.feat_proj_global = nn.Linear(feature_map_ch, 1024)
         if arcface:
             self.margin_head_global = ArcMarginProduct(1024, num_classes, s=s, m=m)
         else:
@@ -416,7 +417,7 @@ class SwinDualBranch(nn.Module):
 
         # === 局部分支 ===
         self.dropout_local = nn.Dropout(0.1)
-        self.feat_proj_local = nn.Linear(feat_dim, 1024)
+        self.feat_proj_local = nn.Linear(feature_map_ch, 1024)
         if arcface:
             self.margin_head_local = ArcMarginProduct(1024, num_classes, s=s, m=m)
         else:
