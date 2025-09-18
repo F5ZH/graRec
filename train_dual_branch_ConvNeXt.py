@@ -176,9 +176,12 @@ def build_loaders(train_dir: str,
         if train_indices is not None and val_indices is not None:
             train_ds = Subset(full_train_ds, train_indices)
             val_ds = Subset(full_train_ds, val_indices)
-            # 为 Subset 设置 targets 属性，以便 sampler 使用
             train_ds.targets = [full_train_ds.targets[i] for i in train_indices]
             val_ds.targets = [full_train_ds.targets[i] for i in val_indices]
+            train_ds.classes = full_train_ds.classes
+            val_ds.classes = full_train_ds.classes
+            train_ds.class_to_idx = full_train_ds.class_to_idx
+            val_ds.class_to_idx = full_train_ds.class_to_idx
         else:
             # 默认：整个训练集作为训练（无验证）
             train_ds = full_train_ds

@@ -176,9 +176,14 @@ def build_loaders(train_dir: str,
         if train_indices is not None and val_indices is not None:
             train_ds = Subset(full_train_ds, train_indices)
             val_ds = Subset(full_train_ds, val_indices)
-            # 为 Subset 设置 targets 属性，以便 sampler 使用
+            # 为 Subset 设置 targets, classes, class_to_idx 属性
             train_ds.targets = [full_train_ds.targets[i] for i in train_indices]
             val_ds.targets = [full_train_ds.targets[i] for i in val_indices]
+            # ✅ 新增：传递 classes 和 class_to_idx 属性
+            train_ds.classes = full_train_ds.classes
+            val_ds.classes = full_train_ds.classes
+            train_ds.class_to_idx = full_train_ds.class_to_idx
+            val_ds.class_to_idx = full_train_ds.class_to_idx
         else:
             # 默认：整个训练集作为训练（无验证）
             train_ds = full_train_ds
@@ -379,7 +384,7 @@ def crop_and_resize_by_attn(images: torch.Tensor, attn_maps: torch.Tensor, outpu
 class SwinDualBranch(nn.Module):
     def __init__(self, arch: str, num_classes: int, use_wsdan: bool = True, K: int = 8,
                  arcface: bool = True, m: float = 0.25, s: float = 30.0, pretrained: bool = False,
-                 local_crop_size: int = 224, lambda_global: float = 1.0, lambda_local: float = 0.5):
+                 local_crop_size: int = 224, lambda_global: float = 1.0, lambda_local: float = 0.5, img_size: int = 384):
         super().__init__()
         assert timm is not None, "Please install timm: pip install timm"
         #修改点一：模型库列表
@@ -390,14 +395,14 @@ class SwinDualBranch(nn.Module):
             'swin_large': 'swin_large_patch4_window7_224',
         }.get(arch, 'swin_base_patch4_window7_224')
         #修改点二：创建方式
-        self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0)
+        self.backbone = timm.create_model(model_name, pretrained=pretrained, num_classes=0, img_size=img_size)
         self.num_classes = num_classes
         self.use_wsdan = use_wsdan
         self.arcface = arcface
         self.local_crop_size = local_crop_size
         self.lambda_global = lambda_global
         self.lambda_local = lambda_local
-
+        self.img_size = img_size
          # ✅ 修改点三：swin的维度特征
         # Swin models typically have a `head` layer, even if num_classes=0.
         # The feature dim is the input dim to the head.
@@ -414,7 +419,6 @@ class SwinDualBranch(nn.Module):
             self.margin_head_global = ArcMarginProduct(1024, num_classes, s=s, m=m)
         else:
             self.fc_global = nn.Linear(1024, num_classes)
-
         # === 局部分支 ===
         self.dropout_local = nn.Dropout(0.1)
         self.feat_proj_local = nn.Linear(feature_map_ch, 1024)
@@ -426,12 +430,25 @@ class SwinDualBranch(nn.Module):
     @torch.no_grad()
     def get_attn(self, x: torch.Tensor):
         feat = self.backbone.forward_features(x)
+        # ✅ 修复: 转换 Swin 输出格式以兼容 WSDAN
+        if feat.dim() == 4 and feat.shape[3] == feat.shape[1]: # Heuristic: [B, H, W, C] 格式
+            feat = feat.permute(0, 3, 1, 2) # 转换为 [B, C, H, W]
         return self.wsdan(feat) if self.use_wsdan else None
 
     def forward(self, x, y: Optional[torch.Tensor] = None, return_attn: bool = False):
-        feat = self.backbone.forward_features(x)  # (B, C, H, W)
-        attn_maps = self.wsdan(feat) if self.use_wsdan else None
+        feat = self.backbone.forward_features(x)  # 可能是 (B, H*W, C) 或 (B, H, W, C)
 
+        # ✅ 修复: 关键修复点 - 将 Swin 特征图转换为标准 NCHW 格式
+        if feat.dim() == 3: # 如果是 (B, L, C) 格式, L=H*W
+            # 获取原图高宽。对于 Swin-T/S/B-224, 在 img_size=384 时, 特征图通常是 12x12
+            hw = int(math.sqrt(feat.shape[1]))
+            feat = feat.view(feat.shape[0], hw, hw, feat.shape[2]) # (B, H, W, C)
+            feat = feat.permute(0, 3, 1, 2) # (B, C, H, W)
+        elif feat.dim() == 4 and feat.shape[3] != 1: # 如果是 (B, H, W, C) 格式
+            feat = feat.permute(0, 3, 1, 2) # (B, C, H, W)
+        # 现在 feat 的格式统一为 (B, C, H, W)
+
+        attn_maps = self.wsdan(feat) if self.use_wsdan else None
         # === 全局分支 ===
         pooled_global = self.global_pool(feat).flatten(1)
         z_global = F.relu(self.feat_proj_global(self.dropout_global(pooled_global)))
@@ -442,13 +459,22 @@ class SwinDualBranch(nn.Module):
                 logits_global = F.linear(F.normalize(z_global), F.normalize(self.margin_head_global.weight)) * self.margin_head_global.s
         else:
             logits_global = self.fc_global(z_global)
-
         # === 局部分支 ===
         if self.use_wsdan and attn_maps is not None:
             # 裁剪最显著区域并放大
             x_local = crop_and_resize_by_attn(x, attn_maps, self.local_crop_size)
+            # ⚠️ 关键修复: 将局部裁剪图缩放到模型期望的输入尺寸 (img_size)
+            x_local = F.interpolate(x_local, size=(self.img_size, self.img_size), mode='bilinear', align_corners=False)
             # 再次提取特征（共享 backbone）
             feat_local = self.backbone.forward_features(x_local)  # (B, C, H', W')
+            # ✅ 修复: 同样转换局部分支的特征图格式
+            if feat_local.dim() == 3:
+                hw = int(math.sqrt(feat_local.shape[1]))
+                feat_local = feat_local.view(feat_local.shape[0], hw, hw, feat_local.shape[2])
+                feat_local = feat_local.permute(0, 3, 1, 2)
+            elif feat_local.dim() == 4 and feat_local.shape[3] != 1:
+                feat_local = feat_local.permute(0, 3, 1, 2)
+
             pooled_local = self.global_pool(feat_local).flatten(1)
             z_local = F.relu(self.feat_proj_local(self.dropout_local(pooled_local)))
             if self.arcface:
@@ -461,10 +487,8 @@ class SwinDualBranch(nn.Module):
         else:
             # 无注意力时，局部分支复制全局分支
             logits_local = logits_global.clone()
-
         # 融合 logits（训练和推理都用）
         logits_fused = logits_global + logits_local
-
         if return_attn:
             return logits_fused, z_global, attn_maps, logits_global, logits_local
         return logits_fused
@@ -477,7 +501,6 @@ class SwinDualBranch(nn.Module):
         else:
             loss_global = F.cross_entropy(logits_global, y, reduction='none', label_smoothing=0.1)
             loss_local = F.cross_entropy(logits_local, y, reduction='none', label_smoothing=0.1)
-
         loss_global = loss_global.mean()
         loss_local = loss_local.mean()
         total_loss = self.lambda_global * loss_global + self.lambda_local * loss_local
@@ -592,7 +615,8 @@ def train(args, fold: Optional[int] = None):
         pretrained=args.pretrained,
         local_crop_size=args.local_crop_size,
         lambda_global=args.lambda_global,
-        lambda_local=args.lambda_local
+        lambda_local=args.lambda_local,
+        img_size=args.img_size
     )
     model = model.to(device)
 
@@ -868,7 +892,8 @@ def predict(args):
         pretrained=False,
         local_crop_size=ck_args.get('local_crop_size', 224),
         lambda_global=ck_args.get('lambda_global', 1.0),
-        lambda_local=ck_args.get('lambda_local', 0.5)
+        lambda_local=ck_args.get('lambda_local', 0.5),
+        img_size=ck_args.get('img_size', 383)
     )
     model.load_state_dict(ckpt['model'], strict=False)
     model.eval().to(device)
