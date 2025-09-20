@@ -18,7 +18,7 @@ def get_args():
                                  'swin_large_patch4_window7_224'],
                         help='选择 Swin Transformer 预训练模型')
     parser.add_argument('--num_classes', type=int, default=-1, help='类别数量，-1 表示从数据集自动推断')
-    parser.add_argument('--pretrained', type=bool, default=True, help='是否加载 ImageNet 预训练权重')
+    parser.add_argument('--pretrained', default="store_true", help='是否加载 ImageNet 预训练权重')
 
     # 训练参数
     parser.add_argument('--epochs', type=int, default=30, help='训练轮数')
