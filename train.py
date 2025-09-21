@@ -4,9 +4,9 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from .utils import save_model, ensure_dir, set_seed
-from .argsloader import get_args
-from dataset.dataloader import create_dataloaders 
+from utils import save_model, ensure_dir, set_seed, save_args_json
+from argsloader import get_args
+from dataset.dataloader import create_dataloaders, robust_iter 
 from models.mymodels import build_model
 from loss.myloss import get_preset_loss_fn
 
@@ -16,7 +16,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
     correct = 0
     total = 0
 
-    progress_bar = tqdm(dataloader, desc=f'Epoch {epoch} [Train]')
+    progress_bar = tqdm(robust_iter(dataloader), desc=f'Epoch {epoch} [Train]')
     for images, labels in progress_bar:
         images, labels = images.to(device), labels.to(device)
 
@@ -73,15 +73,40 @@ def main():
     model = build_model(args)
     model.to(device)
 
-    # 定义损失函数和优化器
+    # 定义损失函数
     criterion = get_preset_loss_fn(args.loss_fn)
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    
 
     best_metric = 0.0  # 用于保存最佳模型的指标，可能是验证集准确率或训练集准确率
     writer = SummaryWriter(log_dir=os.path.join(args.output_dir, 'logs'))
 
+    if args.freeze_backbone_epochs > 0:
+        print(f"[策略] 前 {args.freeze_backbone_epochs} 个 epoch 将冻结骨干网络，仅训练分类头。")
+
+    # 冻结骨干网络的所有参数
+    for name, param in model.named_parameters():
+        if "head" not in name:  # 假设 Swin Transformer 的分类层名为 'head' (timm 库中的命名)
+            param.requires_grad = False
+        else:
+            print(f"  -> 训练参数: {name}")
+
+    # 重新创建优化器，只包含需要更新的参数 (即分类头)
+    optimizer = optim.AdamW([p for p in model.parameters() if p.requires_grad], args.learning_rate, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
     for epoch in range(1, args.epochs + 1):
+        if epoch == args.freeze_backbone_epochs + 1 and args.freeze_backbone_epochs > 0:
+            print(f"[策略] 第 {epoch} 个 epoch，解冻骨干网络，开始全局微调。")
+
+        # 解冻所有参数
+        for param in model.parameters():
+            param.requires_grad = True
+
+        # 重新创建优化器，包含所有参数
+        optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate / 10, weight_decay=args.weight_decay)
+        print("优化器已更新，包含所有参数。")
+        # 重置学习率调度器
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs - epoch + 1)
         train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch)
 
         # 记录训练指标
@@ -109,6 +134,7 @@ def main():
         if current_metric > best_metric:
             best_metric = current_metric
             save_model(model, optimizer, epoch, os.path.join(args.output_dir, 'best_model.pth'))
+            save_args_json(os.path.join(args.output_dir, 'train_args.json'), args)
             print(f'New best model saved with metric: {best_metric:.2f}%')
 
     writer.close()

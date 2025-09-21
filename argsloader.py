@@ -8,20 +8,21 @@ def get_args():
     parser.add_argument('--test_data_path', type=str, default='./data/WebFG-400/test', help='测试数据集根目录')
     parser.add_argument('--clean_val_data_path', type=str, default='', 
                         help='[可选] 纯净验证集根目录。若提供，则用于验证；若不提供，则跳过验证阶段，仅监控训练指标。')
-    parser.add_argument('--output_dir', type=str, default='./runs', help='模型和日志输出目录')
+    parser.add_argument('--output_dir', type=str, default='./runs/WebFG-400', help='模型和日志输出目录')
 
     # 模型参数
-    parser.add_argument('--model_name', type=str, default='swin_base_patch4_window7_224', 
+    parser.add_argument('--model_name', type=str, default='swin_tiny_patch4_window7_224', 
                         choices=['swin_tiny_patch4_window7_224', 
                                  'swin_small_patch4_window7_224', 
                                  'swin_base_patch4_window7_224',
                                  'swin_large_patch4_window7_224'],
                         help='选择 Swin Transformer 预训练模型')
     parser.add_argument('--num_classes', type=int, default=-1, help='类别数量，-1 表示从数据集自动推断')
-    parser.add_argument('--pretrained', default="store_true", help='是否加载 ImageNet 预训练权重')
+    parser.add_argument('--pretrained', action="store_true", help='是否加载 ImageNet 预训练权重')
+    parser.add_argument('--freeze_backbone_epochs', type=int, default=5, help='在前 N 个 epoch 冻结骨干网络（Backbone），只训练分类头。设为 0 则不冻结。')
 
     # 训练参数
-    parser.add_argument('--epochs', type=int, default=30, help='训练轮数')
+    parser.add_argument('--epochs', type=int, default=20, help='训练轮数')
     parser.add_argument('--batch_size', type=int, default=32, help='批大小')
     parser.add_argument('--learning_rate', type=float, default=5e-5, help='初始学习率')
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='权重衰减')
@@ -37,8 +38,8 @@ def get_args():
                     help='输入预设的损失函数组合，如 "default", "focal", "label_smoothing" 等')
 
     # 预测参数
-    parser.add_argument('--checkpoint_path', type=str, default='./runs/best_model.pth', help='用于预测的模型路径')
-    parser.add_argument('--submission_file', type=str, default='./runs/submission.csv', help='提交文件路径')
+    parser.add_argument('--checkpoint_path', type=str, default='./runs/WebFG-400/best_model.pth', help='用于预测的模型路径')
+    parser.add_argument('--submission_file', type=str, default='./runs/WebFG-400/submission.csv', help='提交文件路径')
 
     args = parser.parse_args()
     return args

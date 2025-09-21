@@ -3,9 +3,9 @@ import csv
 import torch
 from PIL import Image
 from tqdm import tqdm
-from .argsloader import get_args
+from argsloader import get_args
 from models.mymodels import build_model
-from .utils import load_model
+from utils import load_model
 from dataset.dataprocess import get_val_transforms
 
 def generate_submission(args):
