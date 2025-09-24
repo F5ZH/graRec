@@ -60,6 +60,43 @@ class GeneralizedCrossEntropy(nn.Module):
         loss = (1 - pred_for_target ** self.q) / self.q
         return loss.mean()
 
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, weight=None, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.weight = weight
+        self.reduction = reduction
+        self.ce = nn.CrossEntropyLoss(weight=weight, reduction='none')
+
+    def forward(self, logits, targets):
+        ce_loss = self.ce(logits, targets)  # (N,)
+        pt = torch.exp(-ce_loss)
+        focal = ((1 - pt) ** self.gamma) * ce_loss
+        if self.reduction == 'mean':
+            return focal.mean()
+        elif self.reduction == 'sum':
+            return focal.sum()
+        return focal
+
+def compute_effective_num_weights(class_counts, beta=0.9999, eps=1e-8):
+    """
+    class_counts: dict {cls_idx: count}
+    返回 torch.Tensor 的 weights，长度 = num_classes，未归一化（但会归一化到 sum = num_classes）
+    使用 Effective Number re-weighting: w_i = (1 - beta) / (1 - beta^{n_i})
+    """
+    num_classes = max(class_counts.keys()) + 1
+    counts = torch.ones(num_classes, dtype=torch.float)
+    for k, v in class_counts.items():
+        counts[k] = float(v)
+    if beta < 0 or beta >= 1:
+        # fallback to inverse-freq
+        weights = 1.0 / (counts + eps)
+    else:
+        effective_num = 1.0 - torch.pow(beta, counts)
+        weights = (1.0 - beta) / (effective_num + eps)
+    # 归一化，使 sum(weights) == num_classes（保持Loss scale稳定）
+    weights = weights / weights.sum() * float(num_classes)
+    return weights
 
 # ==============================
 # 2. 损失函数工厂方法
@@ -93,6 +130,7 @@ def get_loss_fn(loss_name, **kwargs):
         'sce': SymmetricCrossEntropy,  # 别名
         'generalized_ce': GeneralizedCrossEntropy,
         'gce': GeneralizedCrossEntropy,  # 别名
+        'focal': FocalLoss,
     }
 
     if loss_name not in loss_dict:
@@ -118,6 +156,8 @@ def get_preset_loss_fn(preset_name):
         'sce_balanced': ('symmetric_ce', {'alpha': 0.1, 'beta': 1.0}),
         'gce_q7': ('generalized_ce', {'q': 0.7}),
         'gce_q8': ('generalized_ce', {'q': 0.8}),
+        'focal_gamma2': ('focal', {'gamma': 2.0}),
+        'focal_gamma3': ('focal', {'gamma': 3.0}),
     }
 
     if preset_name not in preset_configs:
@@ -138,7 +178,7 @@ if __name__ == "__main__":
     targets = torch.tensor(np.random.randint(0, num_classes, batch_size))
 
     # 测试不同的损失函数
-    for name in ['cross_entropy', 'label_smoothing_ce', 'symmetric_ce', 'generalized_ce']:
+    for name in ['cross_entropy', 'label_smoothing_ce', 'symmetric_ce', 'generalized_ce', 'focal']:
         try:
             criterion = get_loss_fn(name)
             loss = criterion(logits, targets)
@@ -147,7 +187,7 @@ if __name__ == "__main__":
             print(f"Error with {name}: {e}")
 
     # 测试预设
-    for preset in ['default', 'smooth_01', 'gce_q7']:
+    for preset in ['default', 'smooth_01', 'gce_q7', 'focal_gamma2']:
         try:
             criterion = get_preset_loss_fn(preset)
             loss = criterion(logits, targets)

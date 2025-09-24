@@ -32,10 +32,21 @@ def get_args():
     parser.add_argument('--img_size', type=int, default=224, help='输入图像尺寸')
     parser.add_argument('--resize_size', type=int, default=256, help='图像缩放尺寸')
 
-    # 损失函数
-    # 在 argsloader.py 的 get_args() 函数中添加：
+    # 长尾/采样/损失相关（新增）
+    parser.add_argument('--use_weighted_sampler', action='store_true', 
+                        help='是否在训练中使用 WeightedRandomSampler 对长尾做重采样')
+    parser.add_argument('--sampling_power', type=float, default=0.5, 
+                        help='采样权重平滑指数，0 -> 均匀采样，1 -> 反向频率采样，0.5 -> sqrt 平滑')
+    parser.add_argument('--use_effective_num', action='store_true',
+                        help='是否使用 Effective Number (class-balanced) 计算类别权重用于损失')
+    parser.add_argument('--class_balance_beta', type=float, default=0.9999,
+                        help='Effective number beta 参数，接近1时更强的 reweight')
+    parser.add_argument('--use_focal', action='store_true', help='是否使用 Focal Loss')
+    parser.add_argument('--focal_gamma', type=float, default=2.0, help='Focal Loss 的 gamma 参数')
+
+    # 损失函数（保留原有接口）
     parser.add_argument('--loss_fn', type=str, default='default',
-                    help='输入预设的损失函数组合，如 "default", "focal", "label_smoothing" 等')
+                        help='损失函数选择: default / weighted / effective / focal / focal_eff')
 
     # 预测参数
     parser.add_argument('--checkpoint_path', type=str, default='./runs/WebFG-400/best_model.pth', help='用于预测的模型路径')

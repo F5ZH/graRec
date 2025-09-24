@@ -1,5 +1,7 @@
 import os
-from torch.utils.data import DataLoader, Dataset
+from collections import Counter
+import torch
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision.datasets import ImageFolder
 from .dataprocess import get_train_transforms, get_val_transforms
 from .dataprocess import safe_pil_loader  # <-- 新增导入
@@ -25,8 +27,26 @@ def create_dataloaders(args):
         args.num_classes = len(train_dataset.classes)
         print(f"自动检测到类别数量: {args.num_classes}")
 
-    # 创建数据加载器
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    # 统计类别分布（ImageFolder 提供 targets）
+    targets = train_dataset.targets  # list of labels
+    class_counts = dict(Counter(targets))
+    args.class_counts = class_counts  # 将统计信息保存到 args，供后续构造损失使用
+    print(f"[Data] class counts sample: {list(class_counts.items())[:8]}  (total classes {len(class_counts)})")
+
+    # 根据参数决定是否使用 WeightedRandomSampler
+    train_loader = None
+    if getattr(args, 'use_weighted_sampler', False):
+        # 计算每个样本权重： weight = 1.0 / (count[label] ** sampling_power)
+        sampling_power = float(getattr(args, 'sampling_power', 0.5))
+        weights = [1.0 / (class_counts[label] ** sampling_power) for label in targets]
+        sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler,
+                                  num_workers=4, pin_memory=True)
+        print(f"[Sampler] 使用 WeightedRandomSampler, sampling_power={sampling_power}")
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                                  num_workers=4, pin_memory=True)
+
     val_loader = None
     # 如果提供了纯净验证集路径，则创建验证数据加载器
     if hasattr(args, 'clean_val_data_path') and args.clean_val_data_path and os.path.exists(args.clean_val_data_path):
