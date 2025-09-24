@@ -74,7 +74,7 @@ def main():
     model.to(device)
 
     # 定义损失函数（将 args 传入以便使用 class_counts / reweight）
-    criterion = get_preset_loss_fn(args.loss_fn, args)
+    criterion = get_preset_loss_fn(args.loss_fn)
     
 
     best_metric = 0.0  # 用于保存最佳模型的指标，可能是验证集准确率或训练集准确率

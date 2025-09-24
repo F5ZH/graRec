@@ -46,7 +46,7 @@ def get_args():
 
     # 损失函数（保留原有接口）
     parser.add_argument('--loss_fn', type=str, default='default',
-                        help='损失函数选择: default / weighted / effective / focal / focal_eff')
+                        help='损失函数选择: default / smooth_01 / smooth_02 / sce_balanced / gce_q7 / gce_q8 / focal_gamma2 / focal_gamma3')
 
     # 预测参数
     parser.add_argument('--checkpoint_path', type=str, default='./runs/WebFG-400/best_model.pth', help='用于预测的模型路径')
