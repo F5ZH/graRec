@@ -52,5 +52,11 @@ def get_args():
     parser.add_argument('--checkpoint_path', type=str, default='./runs/WebFG-400/best_model.pth', help='用于预测的模型路径')
     parser.add_argument('--submission_file', type=str, default='./runs/WebFG-400/submission.csv', help='提交文件路径')
 
+    # 添加重采样相关参数
+    parser.add_argument('--use_balanced_sampler', action='store_true', default=True,
+                        help='是否使用重采样来平衡类别分布')
+    parser.add_argument('--resample_alpha', type=float, default=1.0,
+                        help='重采样强度，1.0表示完全平衡，0.0表示不重采样')
+
     args = parser.parse_args()
     return args
