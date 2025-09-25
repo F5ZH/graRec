@@ -8,6 +8,14 @@ from models.mymodels import build_model
 from utils import load_model
 from dataset.dataprocess import get_val_transforms
 
+from models.mymodels import build_model
+import models.mymodels
+
+print("Actual mymodels file location:", models.mymodels.__file__)
+print("SwinBaseline source:")
+import inspect
+print(inspect.getsource(models.mymodels.SwinBaseline))
+
 def generate_submission(args):
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")

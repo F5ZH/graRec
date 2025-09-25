@@ -1,20 +1,32 @@
 from torchvision import transforms
-from PIL import Image
+from PIL import Image, ImageFilter
 import os
 import warnings
 import random
 
-class RandomApply:
-    """随机应用一个转换"""
-    def __init__(self, transform, p=0.5):
-        self.transform = transform
+# ======================
+# 自定义增强：随机高斯模糊（兼容 PIL Image）
+# ======================
+class RandomGaussianBlur:
+    """对 PIL Image 应用随机高斯模糊，避免在 ToTensor 前使用 Tensor-only 的 GaussianBlur"""
+    def __init__(self, p=0.2, max_radius=1.0):
+        """
+        Args:
+            p (float): 应用模糊的概率
+            max_radius (float): 高斯模糊半径上限（PIL 中 radius 越大越模糊，通常 0.1~2.0）
+        """
         self.p = p
-    
+        self.max_radius = max_radius
+
     def __call__(self, img):
         if random.random() < self.p:
-            return self.transform(img)
+            radius = random.uniform(0.1, self.max_radius)
+            return img.filter(ImageFilter.GaussianBlur(radius=radius))
         return img
 
+# ======================
+# 数据预处理函数
+# ======================
 def get_train_transforms(args):
     """获取增强的训练集数据增强和预处理"""
     return transforms.Compose([
@@ -34,29 +46,26 @@ def get_train_transforms(args):
         transforms.ColorJitter(
             brightness=0.2,
             contrast=0.2,
-            saturation=0.2,
-            hue=0.1
+            saturation=0.2
         ),
-        
-        # 随机擦除
-        transforms.RandomErasing(p=0.3),
+    
         
         # 随机灰度
         transforms.RandomGrayscale(p=0.1),
         
-        # 随机高斯模糊
-        RandomApply(
-            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 0.5)),
-            p=0.2
-        ),
+        # ✅ 安全的高斯模糊（作用于 PIL Image）
+        RandomGaussianBlur(p=0.2, max_radius=1.0),
         
-        # 标准化
+        # 转为 Tensor 并标准化
         transforms.ToTensor(),
+        # 随机擦除
+        transforms.RandomErasing(p=0.3),
         transforms.Normalize(
             mean=[0.485, 0.456, 0.406],
             std=[0.229, 0.224, 0.225]
         ),
     ])
+
 
 def get_val_transforms(args):
     """获取验证/测试集预处理"""
@@ -67,6 +76,10 @@ def get_val_transforms(args):
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
+
+# ======================
+# 安全图像加载器
+# ======================
 def safe_pil_loader(path: str) -> Image.Image:
     """
     Load an image robustly:
