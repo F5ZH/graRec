@@ -1,8 +1,9 @@
 #训练
 python train.py --pretrained \
-  --output_dir ./runs/WebFG-400-v1
+  --use_balanced_sampler --resample_alpha 1.0 \
+  --output_dir ./runs/WebFG-400-resample
 &&
-tensorboard --logdir=runs/WebFG-400-v1/logs 
+tensorboard --logdir=runs/WebFG-400-resample/logs 
 &&
 #预测
 python predict.py
