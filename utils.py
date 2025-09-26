@@ -5,8 +5,8 @@ import torch
 import json
 import datetime
 
+from models.modelBuild import build_model_from_config
 
-from models.modelBuild import build_model_from_config  
 
 def set_seed(seed=42):
     """设置随机种子以确保结果可复现"""
@@ -17,10 +17,12 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+
 def ensure_dir(directory):
     """确保目录存在"""
     if not os.path.exists(directory):
         os.makedirs(directory)
+
 
 def save_model(model, optimizer, epoch, path, model_args=None):
     """
@@ -40,18 +42,18 @@ def save_model(model, optimizer, epoch, path, model_args=None):
     }
     
     if model_args is not None:
-        # 只保存构建模型所必需的关键参数
         config = {
             'model_name': model_args.model_name,
             'num_classes': model_args.num_classes,
-            'pretrained': model_args.pretrained, # 注意：加载时通常设为 False
-            'img_size': getattr(model_args, 'img_size', 224), # 提供默认值
+            'pretrained': model_args.pretrained,
+            'img_size': getattr(model_args, 'img_size', 224),
         }
         save_dict['model_config'] = config
         print(f"[保存配置] 已保存模型配置: {config}")
 
     torch.save(save_dict, path)
     print(f"模型已保存至: {path}")
+
 
 def load_model(model, path, device, build_new_model=False, model_args=None):
     """
@@ -65,7 +67,7 @@ def load_model(model, path, device, build_new_model=False, model_args=None):
         model_args: 当前的参数对象，用于覆盖保存的配置（可选）
     
     Returns:
-        model: 加载了权重的模型实例
+        model: 加载了权重的模型实例（已移至 device）
     """
     checkpoint = torch.load(path, map_location=device)
     
@@ -76,30 +78,38 @@ def load_model(model, path, device, build_new_model=False, model_args=None):
         config = checkpoint['model_config']
         print(f"[加载配置] 使用保存的模型配置: {config}")
         
-        # 如果提供了当前的 model_args，可以用它来覆盖部分配置（如 num_classes）
         if model_args is not None:
             config['num_classes'] = model_args.num_classes
             print(f"[加载配置] 使用命令行参数覆盖类别数: {model_args.num_classes}")
         
-        
-        # 根据配置构建新模型
         model = build_model_from_config(config)
-        model.to(device)
-        print(f"已根据配置重建模型: {config['model_name']}")
+        # 注意：此时 model 在 CPU，下面统一 .to(device)
 
-    # 加载权重 (处理层名映射)
+    # === 关键修复：正确处理权重键名映射（兼容旧 checkpoint）===
     state_dict = checkpoint['model_state_dict']
     new_state_dict = {}
     for key, value in state_dict.items():
-        if key.startswith('backbone.head.fc.'):
-            new_key = key.replace('backbone.head.fc.', 'backbone.head.')
-            new_state_dict[new_key] = value
+        # 情况1: 旧 checkpoint（无 .fc） -> 映射到新结构（有 .fc）
+        if key == 'backbone.head.weight':
+            new_key = 'backbone.head.fc.weight'
+            print(f"[映射] {key} -> {new_key}")
+        elif key == 'backbone.head.bias':
+            new_key = 'backbone.head.fc.bias'
+            print(f"[映射] {key} -> {new_key}")
+        # 情况2: 新 checkpoint（有 .fc）或其它层 -> 直接保留
         else:
-            new_state_dict[key] = value
+            new_key = key
+        new_state_dict[new_key] = value
 
+    # 加载权重
     model.load_state_dict(new_state_dict, strict=True)
-    print(f"模型权重已成功加载。")
+    
+    # === 关键修复：确保模型在目标设备上 ===
+    model.to(device)
+    
+    print(f"模型权重已成功加载，并已移至设备: {device}")
     return model
+
 
 def save_args_json(path, args):
     """
@@ -109,7 +119,6 @@ def save_args_json(path, args):
     try:
         raw = vars(args)
     except TypeError:
-        # 如果不是 Namespace，尝试用 __dict__ 或直接当 dict 处理
         raw = getattr(args, '__dict__', dict(args))
 
     def _convert(obj):
@@ -119,7 +128,6 @@ def save_args_json(path, args):
             return [_convert(x) for x in obj]
         if isinstance(obj, dict):
             return {str(k): _convert(v) for k, v in obj.items()}
-        # 其余类型统一转换为字符串（device、函数、类等）
         return str(obj)
 
     serializable = {k: _convert(v) for k, v in raw.items()}
