@@ -47,5 +47,13 @@ def get_args():
     parser.add_argument('--resample_alpha', type=float, default=1.0,
                         help='重采样强度，1.0表示完全平衡，0.0表示不重采样')
 
+    # 添加DBSCAN噪声过滤相关参数
+    parser.add_argument('--use_noise_filter', action='store_true',
+                        help='是否使用DBSCAN进行噪声过滤')
+    parser.add_argument('--dbscan_eps', type=float, default=0.5,
+                        help='DBSCAN的eps参数，决定邻域大小')
+    parser.add_argument('--dbscan_min_samples', type=int, default=5,
+                        help='DBSCAN的min_samples参数，决定核心点的邻居数量要求')
+
     args = parser.parse_args()
     return args

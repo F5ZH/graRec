@@ -6,6 +6,8 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision.datasets import ImageFolder
 from .dataprocess import get_train_transforms, get_val_transforms
 from .dataprocess import safe_pil_loader
+from .noise_filter import NoiseFilter
+import pickle
 
 class BalancedImageFolder(ImageFolder):
     """支持重采样的 ImageFolder"""
@@ -32,14 +34,55 @@ class BalancedImageFolder(ImageFolder):
         
         return torch.DoubleTensor(weights)
 
+    @staticmethod
+    def filter_noise_samples(root, transform, cache_path=None, eps=0.5, min_samples=5):
+        """使用DBSCAN过滤噪声样本"""
+        # 如果存在缓存，直接加载
+        if cache_path and os.path.exists(cache_path):
+            with open(cache_path, 'rb') as f:
+                return pickle.load(f)
+        
+        # 创建噪声过滤器并处理数据集
+        noise_filter = NoiseFilter(eps=eps, min_samples=min_samples)
+        keep_paths = noise_filter.filter_noise(root, transform)
+        
+        # 保存结果到缓存
+        if cache_path:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, 'wb') as f:
+                pickle.dump(keep_paths, f)
+        
+        return keep_paths
+
 def create_dataloaders(args):
     """创建训练和验证数据加载器"""
     train_transform = get_train_transforms(args)
     val_transform = get_val_transforms(args)
-
-    # 使用支持重采样的数据集
-    train_dataset = BalancedImageFolder(root=args.train_data_path, transform=train_transform)
-
+    
+    # 添加噪声过滤
+    if getattr(args, 'use_noise_filter', False):
+        print("开始进行噪声过滤...")
+        cache_path = os.path.join(args.output_dir, 'noise_filter_cache.pkl')
+        keep_paths = BalancedImageFolder.filter_noise_samples(
+            args.train_data_path,
+            train_transform,
+            cache_path=cache_path,
+            eps=args.dbscan_eps,
+            min_samples=args.dbscan_min_samples
+        )
+        # 使用过滤后的图像路径创建数据集
+        train_dataset = BalancedImageFolder(
+            root=args.train_data_path,
+            transform=train_transform
+        )
+        train_dataset.samples = [(p, train_dataset.class_to_idx[os.path.basename(os.path.dirname(p))])
+                                for p in keep_paths]
+        train_dataset.targets = [s[1] for s in train_dataset.samples]
+    else:
+        train_dataset = BalancedImageFolder(
+            root=args.train_data_path,
+            transform=train_transform
+        )
     # 动态设置类别数
     if args.num_classes == -1:
         args.num_classes = len(train_dataset.classes)
