@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Single-file, single-model training & inference pipeline
-for "Network-Supervised Fine-Grained Image Recognition" competition.
+Single-file, single-model training & inference pipeline for
+"Network-Supervised Fine-Grained Image Recognition" competition.
 
 ✅ Constraints:
 - Uses ONLY ImageNet-1k pretrained weights (timm/torchvision) ✔
@@ -13,8 +13,7 @@ for "Network-Supervised Fine-Grained Image Recognition" competition.
 - Class-aware reweighting ✔
 - Consistency Regularization ✔
 - Uniform Model Soup (weights average, still single model at test) ✔
-- NEW: Embedding export (--mode embed) ✔
-- NEW: Unsupervised K-Means clustering (--mode cluster) ✔
+- Exports required CSVs ✔
 """
 
 # ---------- CUDA memory fragmentation guard (set BEFORE importing torch) ----------
@@ -40,19 +39,18 @@ from torchvision import transforms
 from torchvision.datasets import ImageFolder
 import torchvision.transforms.functional as TF  # tensor augs
 
+import warnings
+
+# visualization
+from torch.utils.tensorboard import SummaryWriter
+
 # Robust PIL settings
 from PIL import Image, ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True  # allow truncated files to load
 Image.MAX_IMAGE_PIXELS = 120_000_000    # disable DecompressionBombError
 
-# visualization
 try:
-    from torch.utils.tensorboard import SummaryWriter
-except Exception:
-    SummaryWriter = None
-
-try:
-    import timm  # convnext backbones
+    import timm  # convnext backbone
 except Exception:
     timm = None
 
@@ -312,6 +310,8 @@ class ArcMarginProduct(nn.Module):
         logits = one_hot * phi + (1.0 - one_hot) * cosine
         logits *= self.s
         return logits
+
+
 # -------------------------
 # WS-DAN style attention
 # -------------------------
@@ -347,26 +347,21 @@ def wsdan_erase(images: torch.Tensor, attn_maps: torch.Tensor, p: float = 0.5, t
 # Model wrapper
 # -------------------------
 class ConvNeXtWS(nn.Module):
-    """
-    Backbones (ALL **ImageNet-1k only** weights):
-      - ConvNeXt V1:  convnext_{tiny,small,base,large}.in1k
-      - ConvNeXt V2:  convnextv2_{tiny,small,base,large}.fcmae_ft_in1k
-    """
     def __init__(self, arch: str, num_classes: int, use_wsdan: bool = True, K: int = 8,
                  arcface: bool = True, m: float=0.25, s: float=30.0, pretrained: bool=False):
         super().__init__()
         assert timm is not None, "Please install timm: pip install timm"
         model_name = {
-            # --- V1 (in1k only) ---
-            'convnext_tiny':  'convnext_tiny.in1k',
-            'convnext_small': 'convnext_small.in1k',
-            'convnext_base':  'convnext_base.in1k',
-            'convnext_large': 'convnext_large.in1k',
-            # --- V2 (fcmae + fine-tuned on in1k only) ---
-            'convnextv2_tiny':  'convnextv2_tiny.fcmae_ft_in1k',
-            'convnextv2_small': 'convnextv2_small.fcmae_ft_in1k',
-            'convnextv2_base':  'convnextv2_base.fcmae_ft_in1k',
-            'convnextv2_large': 'convnextv2_large.fcmae_ft_in1k',
+            # --- ConvNeXt V1: 仅 ImageNet-1k ---
+            'convnext_tiny':   'convnext_tiny.in1k',
+            'convnext_small':  'convnext_small.in1k',
+            'convnext_base':   'convnext_base.in1k',
+            'convnext_large':  'convnext_large.in1k',
+            # --- ConvNeXt V2: 仅 ImageNet-1k (FCMAE 微调) ---
+            'convnextv2_tiny':   'convnextv2_tiny.fcmae_ft_in1k',
+            'convnextv2_small':  'convnextv2_small.fcmae_ft_in1k',
+            'convnextv2_base':   'convnextv2_base.fcmae_ft_in1k',
+            'convnextv2_large':  'convnextv2_large.fcmae_ft_in1k',
         }.get(arch, 'convnext_base.in1k')
         self.backbone = timm.create_model(model_name, pretrained=pretrained, features_only=False, num_classes=0)
         self.num_classes = num_classes
@@ -389,7 +384,7 @@ class ConvNeXtWS(nn.Module):
         feat = self.backbone.forward_features(x)  # (B, C, H, W)
         return self.wsdan(feat) if self.use_wsdan else None
 
-    def forward(self, x, y: Optional[torch.Tensor] = None, return_attn: bool = False, return_feat: bool = False):
+    def forward(self, x, y: Optional[torch.Tensor] = None, return_attn: bool = False):
         feat = self.backbone.forward_features(x)  # (B, C, H, W)
         attn_maps = self.wsdan(feat) if self.use_wsdan else None
         pooled = self.global_pool(feat).flatten(1)
@@ -401,8 +396,8 @@ class ConvNeXtWS(nn.Module):
                 logits = F.linear(F.normalize(z), F.normalize(self.margin_head.weight)) * self.margin_head.s
         else:
             logits = self.fc(z)
-        if return_attn or return_feat:
-            return logits, (z if return_feat else None), attn_maps
+        if return_attn:
+            return logits, z, attn_maps
         return logits
 
 
@@ -555,6 +550,8 @@ class PseudoLabelFolder(Dataset):
         path, soft, w = self.samples[i]
         img = self.tf(safe_pil_loader(path))
         return img, soft, w
+
+
 # -------------------------
 # Training / Evaluation
 # -------------------------
@@ -567,16 +564,11 @@ def train(args):
     set_seed(args.seed)
 
     # TensorBoard
-    if SummaryWriter is not None:
-        writer = SummaryWriter(log_dir=args.outdir + '/tb_logs')
-        print(f"📊 TensorBoard logs -> {args.outdir}/tb_logs")
-        hparams = {k: v for k, v in vars(args).items() if isinstance(v, (int, float, str, bool))}
-        try:
-            writer.add_hparams(hparams, {})
-        except Exception:
-            pass
-    else:
-        writer = None
+    log_path = args.outdir + '/tb_logs'
+    writer = SummaryWriter(log_dir=log_path)
+    print(f"📊 TensorBoard logs -> {log_path}")
+    hparams = {k: v for k, v in vars(args).items() if isinstance(v, (int, float, str, bool))}
+    writer.add_hparams(hparams, {})
 
     # data
     train_loader, val_loader, train_ds = build_loaders(
@@ -728,6 +720,7 @@ def train(args):
                 have_soft = False
 
             # optional MixUp/CutMix
+            soft_targets = None
             if args.mixup>0 or args.cutmix>0:
                 imgs, soft_targets, mix_meta = mixup_cutmix(imgs, (ys_soft if have_soft else ys_hard), args.mixup, args.cutmix, num_classes)
                 have_soft = True
@@ -766,7 +759,7 @@ def train(args):
                     ws_mb = None
 
                 with torch.amp.autocast('cuda', enabled=args.amp):
-                    logits_mb, feats_mb, _ = model(imgs_mb, ys_hard_mb if model.arcface else None, return_attn=True, return_feat=True)
+                    logits_mb, feats_mb, _ = model(imgs_mb, ys_hard_mb if model.arcface else None, return_attn=True)
 
                     # base supervised loss (supports soft or hard)
                     if ys_soft_mb is not None:
@@ -778,7 +771,7 @@ def train(args):
                             noise_reg_mb = elr_mem(logits_mb, ys_hard_mb, idxs_mb)
                             loss_all_mb = ce_mb + noise_reg_mb
                         elif args.loss == 'sce':
-                            loss_all_mb = sce(logits_mb, ys_hard_mb)
+                            loss_all_mb = SCELoss(alpha=args.sce_alpha, beta=args.sce_beta, num_classes=num_classes)(logits_mb, ys_hard_mb)
                         elif args.loss == 'gce':
                             loss_all_mb = gce(logits_mb, ys_hard_mb)
                         elif args.loss == 'eql':
@@ -833,7 +826,6 @@ def train(args):
 
                     loss_mb = loss_mb / accum_steps
 
-                # AMP backward (use the same scaler instance)
                 scaler.scale(loss_mb).backward()
 
                 with torch.no_grad():
@@ -854,15 +846,13 @@ def train(args):
         print(f"Epoch {epoch}: loss={np.mean(loss_meter):.4f}, acc~={np.mean(acc_meter):.4f}")
 
         # TB logs
-        if writer is not None:
-            writer.add_scalar('Loss/Train', float(np.mean(loss_meter)), epoch)
-            writer.add_scalar('Accuracy/Train', float(np.mean(acc_meter)), epoch)
+        writer.add_scalar('Loss/Train', float(np.mean(loss_meter)), epoch)
+        writer.add_scalar('Accuracy/Train', float(np.mean(acc_meter)), epoch)
 
         # validate
         if val_loader is not None:
             val_acc = evaluate(model, val_loader, device)
-            if writer is not None:
-                writer.add_scalar('Accuracy/Val', val_acc, epoch)
+            writer.add_scalar('Accuracy/Val', val_acc, epoch)
             print(f"  VAL acc={val_acc:.4f}")
             # save best
             if val_acc > best_acc:
@@ -871,8 +861,7 @@ def train(args):
         else:
             if (epoch+1) % 5 == 0:
                 torch.save({'model': model.state_dict(), 'epoch': epoch, 'args': vars(args)}, outdir / 'last.pt')
-        if writer is not None:
-            writer.flush()
+        writer.flush()
 
     torch.save({'model': model.state_dict(), 'epoch': args.epochs-1, 'args': vars(args)}, outdir / 'final.pt')
     print(f"Training finished. Checkpoints saved in {outdir}")
@@ -1019,7 +1008,6 @@ def make_pseudo(args):
     ds = TestImages(args.unlabeled_dir, args.img_size)
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers,
                     pin_memory=True, persistent_workers=(args.workers > 0),
-                    drop_last=False,
                     prefetch_factor=(2 if args.workers > 0 else None))
 
     rows = []
@@ -1077,143 +1065,11 @@ def make_soup(args):
 
 
 # -------------------------
-# NEW: Embedding export (features npz/csv)
-# -------------------------
-class PlainImages(Dataset):
-    def __init__(self, root: str, size: int):
-        self.root = root
-        self.size = size
-        self.files = []
-        for dp, _, fnames in os.walk(root):
-            for f in fnames:
-                if f.lower().endswith(('.jpg','.jpeg','.png','.bmp')):
-                    self.files.append(os.path.join(dp, f))
-        self.files.sort()
-        self.tf = transforms.Compose([
-            transforms.Resize(int(size*1.15)),
-            transforms.CenterCrop(size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
-        ])
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, i):
-        path = self.files[i]
-        img = safe_pil_loader(path)
-        return self.tf(img), path
-
-@torch.no_grad()
-def extract_embeddings(args):
-    """
-    Export penultimate features (after feat_proj, 1024-D) for a directory.
-    Saves: {paths, feats( N x 1024 )} to .npz and optionally .csv (first few dims).
-    """
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    ck_args = ckpt.get('args', {})
-    num_classes = ck_args.get('num_classes', args.num_classes if hasattr(args, 'num_classes') else 1000)
-    model = ConvNeXtWS(arch=ck_args.get('arch', args.arch),
-                       num_classes=num_classes,
-                       use_wsdan=ck_args.get('use_wsdan', True),
-                       K=ck_args.get('K', 8),
-                       arcface=ck_args.get('arcface', True),
-                       m=ck_args.get('margin', 0.25),
-                       s=ck_args.get('scale', 30.0),
-                       pretrained=False).to(device).eval()
-    model.load_state_dict(ckpt['model'], strict=False)
-
-    ds = PlainImages(args.embed_dir, args.img_size)
-    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers,
-                    pin_memory=True, persistent_workers=(args.workers>0),
-                    prefetch_factor=(2 if args.workers>0 else None))
-
-    feats = []
-    paths = []
-    with torch.no_grad():
-        for imgs, fpaths in tqdm(dl, desc='Embed'):
-            imgs = imgs.to(device, non_blocking=True)
-            logits, z, _ = model(imgs, y=None, return_attn=True, return_feat=True)
-            feats.append(z.detach().cpu().numpy())
-            paths += list(fpaths)
-    feats = np.concatenate(feats, axis=0)
-    out_npz = Path(args.outdir) / 'embeddings.npz'
-    np.savez_compressed(out_npz, paths=np.array(paths), feats=feats)
-    print(f"[embed] Saved {feats.shape} to {out_npz}")
-    if args.embed_csv:
-        keep = min(feats.shape[1], 16)
-        df = pd.DataFrame(feats[:, :keep])
-        df.insert(0, 'path', paths)
-        out_csv = Path(args.outdir) / 'embeddings_head.csv'
-        df.to_csv(out_csv, index=False)
-        print(f"[embed] Also saved CSV (first {keep} dims) to {out_csv}")
-
-
-# -------------------------
-# NEW: Unsupervised K-Means (on exported embeddings)
-# -------------------------
-def kmeans_np(X: np.ndarray, K: int, iters: int = 50, seed: int = 42):
-    rng = np.random.default_rng(seed)
-    N, D = X.shape
-    # k-means++ init
-    centroids = np.empty((K, D), dtype=np.float32)
-    idx0 = rng.integers(0, N)
-    centroids[0] = X[idx0]
-    dist2 = np.full(N, np.inf, dtype=np.float64)
-    for k in range(1, K):
-        d = np.sum((X - centroids[k-1])**2, axis=1)
-        dist2 = np.minimum(dist2, d)
-        probs = dist2 / (dist2.sum() + 1e-12)
-        idxk = rng.choice(N, p=probs)
-        centroids[k] = X[idxk]
-    labels = np.zeros(N, dtype=np.int32)
-    for _ in range(iters):
-        # assign
-        d2 = np.sum((X[:, None, :] - centroids[None, :, :])**2, axis=2)
-        labels = np.argmin(d2, axis=1).astype(np.int32)
-        # update
-        for k in range(K):
-            mask = labels == k
-            if np.any(mask):
-                centroids[k] = X[mask].mean(axis=0).astype(np.float32)
-    return labels, centroids
-
-def cluster(args):
-    """
-    Load embeddings.npz (from --mode embed) and run K-Means.
-    Saves cluster labels CSV mapping each path -> cluster_id.
-    Optionally reduces dims via simple PCA (SVD) before clustering.
-    """
-    npz_path = Path(args.emb_npz if args.emb_npz else Path(args.outdir)/'embeddings.npz')
-    assert npz_path.exists(), f"embeddings npz not found: {npz_path}"
-    data = np.load(npz_path, allow_pickle=True)
-    paths = data['paths']
-    feats = data['feats'].astype(np.float32)
-
-    # Optional PCA
-    if args.kmeans_dim > 0 and args.kmeans_dim < feats.shape[1]:
-        X = feats - feats.mean(axis=0, keepdims=True)
-        U, S, Vt = np.linalg.svd(X, full_matrices=False)
-        feats_use = (U[:, :args.kmeans_dim] * S[:args.kmeans_dim]).astype(np.float32)
-    else:
-        feats_use = feats
-
-    labels, cents = kmeans_np(feats_use, K=args.kmeans_k, iters=args.kmeans_iters, seed=args.seed)
-    out_csv = Path(args.outdir) / 'clusters.csv'
-    df = pd.DataFrame({'path': paths, 'cluster': labels})
-    df.to_csv(out_csv, index=False)
-    print(f"[cluster] Saved {len(paths)} assignments to {out_csv}")
-    ct = df['cluster'].value_counts().sort_index()
-    print(f"[cluster] sizes: {ct.to_dict()}")
-
-
-# -------------------------
 # CLI
 # -------------------------
 def get_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--mode', choices=['train','predict','pseudo','soup','embed','cluster'], required=True)
+    ap.add_argument('--mode', choices=['train','predict','pseudo','soup'], required=True)
 
     # paths
     ap.add_argument('--train_dir', type=str, default=None)
@@ -1221,21 +1077,9 @@ def get_args():
     ap.add_argument('--test_dir', type=str, default=None)
     ap.add_argument('--unlabeled_dir', type=str, default=None)
     ap.add_argument('--outdir', type=str, default='runs/exp')
-    ap.add_argument('--classes', type=str, default=None)
-
-    # embedding / clustering
-    ap.add_argument('--embed_dir', type=str, default=None, help='directory to extract embeddings from')
-    ap.add_argument('--embed_csv', action='store_true', help='also dump first 16 dims to CSV')
-    ap.add_argument('--num_classes', type=int, default=1000, help='fallback if not in ckpt args')
-    ap.add_argument('--emb_npz', type=str, default=None, help='path to embeddings.npz (default outdir/embeddings.npz)')
-    ap.add_argument('--kmeans_k', type=int, default=20)
-    ap.add_argument('--kmeans_iters', type=int, default=50)
-    ap.add_argument('--kmeans_dim', type=int, default=0, help='optional PCA dim before kmeans (0=disabled)')
 
     # model & data
-    ap.add_argument('--arch', type=str, default='convnext_base',
-                    choices=['convnext_tiny','convnext_small','convnext_base','convnext_large',
-                             'convnextv2_tiny','convnextv2_small','convnextv2_base','convnextv2_large'])
+    ap.add_argument('--arch', type=str, default='convnext_base',choices=['convnext_tiny','convnext_small','convnext_base','convnext_large','convnextv2_tiny','convnextv2_small','convnextv2_base','convnextv2_large'])
     ap.add_argument('--img_size', type=int, default=384)
     ap.add_argument('--batch_size', type=int, default=128)
     ap.add_argument('--workers', type=int, default=8)
@@ -1297,22 +1141,15 @@ def get_args():
     ap.set_defaults(grad_ckpt=True)
     ap.add_argument('--microbatch', type=int, default=16)
 
-    # Self-cleaning
-    ap.add_argument('--self_clean', action='store_true', help='Enable self-clean with confidence EMA')
-    ap.add_argument('--clean_warmup', type=int, default=5, help='Epochs before enabling self-clean filtering')
-    ap.add_argument('--clean_thresh', type=float, default=0.5, help='Threshold for self-clean confidence')
-    ap.add_argument('--clean_min_w', type=float, default=0.3, help='Minimum weight for low-confidence samples')
-    ap.add_argument('--clean_momentum', type=float, default=0.9, help='EMA momentum for confidence tracking')
-
     # resume
     ap.add_argument('--init_from', type=str, default=None, help='Load model weights to continue training.')
-    ap.add_argument('--seed', type=int, default=42)
 
-    # Predict
-    ap.add_argument('--checkpoint', type=str, default=None)
-    ap.add_argument('--csv_path', type=str, default='pred_results.csv')
-    ap.add_argument('--tta_flip', action='store_true')
-    ap.add_argument('--logit_adjust_tau', type=float, default=0.0, help='>0 enables logit adjustment by class freq')
+    # Self-cleaning
+    ap.add_argument('--self_clean', action='store_true', help='Online self-clean by confidence EMA')
+    ap.add_argument('--clean_warmup', type=int, default=10)
+    ap.add_argument('--clean_thresh', type=float, default=0.4)
+    ap.add_argument('--clean_min_w', type=float, default=0.3)
+    ap.add_argument('--clean_momentum', type=float, default=0.9)
 
     # Pseudo labeling
     ap.add_argument('--pseudo_thresh', type=float, default=0.9)
@@ -1320,9 +1157,21 @@ def get_args():
     ap.add_argument('--pseudo_mix', type=float, default=0.5, help='Weight scale for pseudo samples (0~1)')
     ap.add_argument('--pseudo_topk', type=int, default=3, help='Top-K classes for soft pseudo CSV (make_pseudo)')
 
+    # Predict
+    ap.add_argument('--checkpoint', type=str, default=None)
+    ap.add_argument('--csv_path', type=str, default='pred_results.csv')
+    ap.add_argument('--classes', type=str, default=None)
+    ap.add_argument('--tta_flip', action='store_true')
+    ap.add_argument('--logit_adjust_tau', type=float, default=0.0, help='>0 enables logit adjustment by class freq')
+
     # Soup
     ap.add_argument('--soup_ckpts', nargs='*', default=None)
 
+    # toggles
+    ap.add_argument('--consistency_lambda', type=float, default=1.0, help='Weight for consistency KL loss (0 to disable)')
+    ap.add_argument('--class_aware', action='store_true', help='Enable class-aware reweighting')
+
+    ap.add_argument('--seed', type=int, default=42)
     args = ap.parse_args()
     return args
 
@@ -1344,23 +1193,12 @@ if __name__ == '__main__':
     elif args.mode == 'pseudo':
         assert args.unlabeled_dir and os.path.isdir(args.unlabeled_dir), 'unlabeled_dir not found'
         assert args.checkpoint and os.path.isfile(args.checkpoint), 'checkpoint not found'
-        Path(args.outdir).mkdir(parents=True, exist_ok=True)
         make_pseudo(args)
 
     elif args.mode == 'soup':
         assert args.soup_ckpts, 'provide --soup_ckpts ckpt1 ckpt2 ...'
         Path(args.outdir).mkdir(parents=True, exist_ok=True)
         make_soup(args)
-
-    elif args.mode == 'embed':
-        assert args.embed_dir and os.path.isdir(args.embed_dir), 'embed_dir not found'
-        assert args.checkpoint and os.path.isfile(args.checkpoint), 'checkpoint not found'
-        Path(args.outdir).mkdir(parents=True, exist_ok=True)
-        extract_embeddings(args)
-
-    elif args.mode == 'cluster':
-        Path(args.outdir).mkdir(parents=True, exist_ok=True)
-        cluster(args)
 
     else:
         raise ValueError('Unknown mode')
