@@ -1,0 +1,13 @@
+device: "cuda:0"
+
+quality:
+  min_resolution: 224
+  blur_threshold: 50.0
+
+feature:
+  model: "dinov2_vits14"   # 可选: "resnet50", "clip-ViT-B/16", "dinov2_vitb14"
+  batch_size: 32
+
+dbscan:
+  eps: 1.2
+  min_samples: 2

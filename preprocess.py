@@ -7,8 +7,8 @@ import multiprocessing as mp
 # 设置最大像素限制
 Image.MAX_IMAGE_PIXELS = 120_000_000
 
-src_dir = "/root/autodl-tmp/project/data/WebiNat-5000/train"
-dst_dir = "/root/autodl-tmp/project/data/WebiNat-5000/train_processed"
+src_dir = "/root/autodl-tmp/project/data/WebFG-400/train"
+dst_dir = "/root/autodl-tmp/project/data/WebFG-400/train_processed"
 
 # 支持的扩展名
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
